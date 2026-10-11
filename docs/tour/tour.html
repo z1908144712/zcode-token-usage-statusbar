@@ -125,7 +125,7 @@ if (Q.print) document.documentElement.style.zoom = Q.print;
 /* 分项清单（编号 / 高亮参数 / 素材文件 / 标题 / 说明）——顺序即条面显示顺序。
  * 开启「本轮」后条面 it 索引：0=tps 1=ctx 2=turn 3=win 4=tools 5=today 6=sub */
 var ITEMS = [
-  { no: "①", hl: "0",    file: "item-1.png", name: "生成速度", desc: "最近一次请求的可见回答速度（token/s，已扣除推理 token）。随快慢三档变色：≥150 绿、70–150 黄、&lt;70 红，模型快慢一眼可读。" },
+  { no: "①", hl: "0",    file: "item-1.png", name: "生成速度", desc: "最近一次请求的生成速度（token/s；分子是否含推理 token 按 provider 判定）。随快慢三档变色：≥120 绿、60–120 黄、&lt;60 红，模型快慢一眼可读。" },
   { no: "②", hl: "1",    file: "item-2.png", name: "上下文容量", desc: "微进度条 + 百分比显示当前会话的上下文占比，颜色随占比从绿转黄再转红；超限被拒时亮红闪烁并弹出告警气泡。窗口大小自动识别、跟随模型。" },
   { no: "③", hl: "2",    file: "item-3.png", name: "本轮", desc: "最近一轮对话的 token 消耗、缓存命中率、请求次数、单次耗时与首字延迟。悬停可看 输入 / 输出 / 缓存命中 / 缓存写入 / 思考 的拆分。" },
   { no: "④", hl: "3",    file: "item-4.png", name: "会话累计", desc: "当前会话全部请求的总消耗与轮次统计；每个对话窗口只统计自己的数据，多窗口互不串显。悬停同样有明细拆分。" },

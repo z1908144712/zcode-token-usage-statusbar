@@ -119,6 +119,43 @@ def _scan_session_ids(con):
     return _cached_agg("scan", run)
 
 
+# first_token_at 的语义按 provider 不同，同库实测两种都存在，生成速度的分子必须跟着窗口走：
+#   在「首个流式块」就落章 → 推理也在窗口内 → 分子用全部 output_tokens
+#   在「推理结束」才落章   → 窗口只有可见回答 → 分子必须扣掉 reasoning_tokens
+# 判据：首 token 若晚于推理，ttft 必然随 reasoning_tokens 增长。用最小二乘斜率量这件事——
+# 每行都摊着一份常数预处理，朴素比值 sum(ttft)/sum(reason) 会被小推理量的行抬高（实测把
+# new-provider 的 0.11 抬成 2.35，直接判反），最小二乘的截距正好把常数吸收掉。
+# 斜率 ≥ 2.0 ms/reason-token 意味着推理速率得快过 500 t/s 才讲得通——任何模型都做不到，故判为后者。
+# 实测：new-provider 0.11 ms/tok（ttft 与推理量无关，恒 ~2.5s，纯预处理）→ 不扣；
+#       new-provider-2 4.29 ms/tok（≈233 t/s，推理确实耗在 ttft 里）→ 扣。两侧余量 18 倍 / 2 倍。
+_REASON_BEFORE_FTA_MS_PER_TOK = 2.0
+
+
+def _reason_before_first_token(con):
+    """→ set(provider_id)：first_token_at 落在推理阶段之后、分子需扣推理 token 的 provider。
+    按 provider 判定而不是逐行按数值上限切：实测虚高值是 400~1100 连续分布、没有空档，
+    按阈值切会把同质样本切成两半（同一个模型一半绿一半红）。
+    推理样本不足 5 条或推理量无变化的 provider 不进集合——reasoning 恒 0 时扣与不扣等价。"""
+    def run():
+        rows = con.execute(
+            """select provider_id, count(*), sum(reasoning_tokens), sum(time_to_first_token_ms),
+                      sum(reasoning_tokens * time_to_first_token_ms),
+                      sum(reasoning_tokens * reasoning_tokens)
+               from model_usage
+               where status='completed' and first_token_at is not null
+                 and coalesce(time_to_first_token_ms,0) > 0 and coalesce(reasoning_tokens,0) > 0
+               group by provider_id""").fetchall()
+        out = set()
+        for pid, n, sx, sy, sxy, sxx in rows:
+            den = n * sxx - sx * sx
+            if n < 5 or den <= 0:
+                continue
+            if (n * sxy - sx * sy) / den >= _REASON_BEFORE_FTA_MS_PER_TOK:
+                out.add(pid)
+        return out
+    return _cached_agg("fta_semantics", run)
+
+
 def session_usage(con, sid):
     # last_request_input 取最近一次 completed 请求的 input_tokens（= 当前上下文容量）。
     # 不能用 max(input_tokens)：会话压缩后 input 骤降，峰值永远不回落（v28 修复）。
@@ -615,7 +652,8 @@ def _session_snapshot(con, sid, cfg):
     u = session_usage(con, sid)
     last = con.execute(
         """select duration_ms, coalesce(time_to_first_token_ms,0), completed_at, turn_id, model_id,
-                  output_tokens, first_token_at, coalesce(reasoning_tokens,0) as reasoning_tokens
+                  output_tokens, first_token_at, coalesce(reasoning_tokens,0) as reasoning_tokens,
+                  provider_id
            from model_usage where session_id=? and status='completed'
            order by completed_at desc limit 1""",
         (sid,),
@@ -656,18 +694,23 @@ def _session_snapshot(con, sid, cfg):
     lr = con.execute("select max(completed_at) from model_usage where session_id=?", (sid,)).fetchone()
     active = bool(lr and lr[0] and int(time.time() * 1000) - lr[0] < SESSION_TIMEOUT_MS)
     ctx_auto = lookup_context_window(last["model_id"]) if last else None
-    # 生成速度：分母"首 token → 完成"只覆盖可见回答那段，而 output_tokens 含 reasoning_tokens
-    # （raw_usage_json 实测 out=5043 / reason=3649；且首 token 落在推理阶段结束后——推理 token
-    # 数与 TTFT 之比稳定在 176~183 t/s）。分子不减推理 = 拿推理 token 除以不含它的时间，实测
-    # 能冲到 10713 t/s。无 first_token_at 时（provider 未回传首 token 计时）切不出生成窗口，
+    # 生成速度：分子必须与分母窗口覆盖同一批 token，而 first_token_at 的语义按 provider 不同
+    # （同库实测两种都有，判定见 _reason_before_first_token）：
+    #   首个流式块就落章 → 推理也在窗口内 → 分子 = output_tokens
+    #   推理结束才落章   → 窗口只有可见回答 → 分子 = output_tokens - reasoning_tokens
+    # 两个方向搞错的代价都很大：少扣会把真值做成 10713 t/s，多扣会把 206 t/s 压成 74 t/s。
+    # 取哪个由 provider 决定，不能凭输出长度猜——实测虚高值在 400~1100 连续分布，无空档可切。
+    # 无 first_token_at 时（provider 不回传首 token 计时，本机实测约三分之一）切不出生成窗口，
     # 退化为"输出 token ÷ 请求总耗时"；该分母含输入预处理（20 万 token 输入实测 8~10s），
     # 只对长输出请求接近真实生成速度，短输出偏低——属数据缺失，不代表模型慢。
     tps = 0
     if last and last["output_tokens"]:
         if (last["first_token_at"] and last["completed_at"]
                 and last["completed_at"] > last["first_token_at"]):
-            vis = max(last["output_tokens"] - last["reasoning_tokens"], 0)
-            tps = round(vis / ((last["completed_at"] - last["first_token_at"]) / 1000), 1)
+            num = last["output_tokens"]
+            if last["provider_id"] in _reason_before_first_token(con):
+                num = max(num - last["reasoning_tokens"], 0)
+            tps = round(num / ((last["completed_at"] - last["first_token_at"]) / 1000), 1)
         elif last["duration_ms"]:
             tps = round(last["output_tokens"] / (last["duration_ms"] / 1000), 1)
     sub_rows = con.execute(

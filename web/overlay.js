@@ -120,9 +120,9 @@
   // 客户端插件条的字体栈（插件 overlay.js:167 原样）
   var MONO_C = "Consolas,'Cascadia Mono',Menlo,'Microsoft YaHei UI','Microsoft YaHei',monospace";
 
-  /* 生成速度三档（v62）：口径与阈值同插件 overlay.js —— 分子已扣推理 token，故阈值抬到 150/70。
-   * 原 70/40 是按"含推理 token ÷ 不含推理阶段的时间"定的，修正后同样本普遍高一个档位。 */
-  function speedTone(v) { return v == null ? TONE.mute : v >= 150 ? TONE.ok : v >= 70 ? TONE.warn : TONE.bad; }
+  /* 生成速度三档（v62）：口径与阈值同插件 overlay.js —— 分子是否扣推理 token 由 provider 的
+   * first_token_at 语义决定（zusage.py 侧判定），三档阈值取 120/60。 */
+  function speedTone(v) { return v == null ? TONE.mute : v >= 120 ? TONE.ok : v >= 60 ? TONE.warn : TONE.bad; }
   /* 上下文三档：窗口 ≥100 万时同一百分比的绝对量更大 → 40/60 提前预警，其余 70/85
    * （插件 overlay.js:526-532 同款口径）。size 缺省视为小窗口，保持窄屏原口径。 */
   function ctxTone(p, exc, size) {
