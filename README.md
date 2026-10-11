@@ -21,7 +21,7 @@ The status bar floats at the bottom of the ZCode window and shows real-time toke
 
 ![Generation speed tooltip](docs/tour/shots/en/item-1.png)
 
-Tokens per second of the most recent completed request (output tokens ÷ generation time, from first token to completion), color-coded in three tiers: ≥70 green, 40–70 yellow, <40 red — how fast the model is right now, at a glance.
+Tokens per second of the most recent completed request — visible answer tokens ÷ generation time (first token → completion), color-coded in three tiers: ≥150 green, 70–150 yellow, <70 red — how fast the model is right now, at a glance. The numerator excludes reasoning tokens on purpose: the denominator starts at the first visible token, which arrives *after* the reasoning phase, so counting reasoning tokens there would divide them by a window they were never generated in. When the provider reports no first-token timestamp the item falls back to output tokens ÷ total request time, which includes prompt processing and therefore reads lower.
 
 ### ② Context Capacity
 

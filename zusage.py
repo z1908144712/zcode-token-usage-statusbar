@@ -615,7 +615,7 @@ def _session_snapshot(con, sid, cfg):
     u = session_usage(con, sid)
     last = con.execute(
         """select duration_ms, coalesce(time_to_first_token_ms,0), completed_at, turn_id, model_id,
-                  output_tokens, first_token_at
+                  output_tokens, first_token_at, coalesce(reasoning_tokens,0) as reasoning_tokens
            from model_usage where session_id=? and status='completed'
            order by completed_at desc limit 1""",
         (sid,),
@@ -656,16 +656,20 @@ def _session_snapshot(con, sid, cfg):
     lr = con.execute("select max(completed_at) from model_usage where session_id=?", (sid,)).fetchone()
     active = bool(lr and lr[0] and int(time.time() * 1000) - lr[0] < SESSION_TIMEOUT_MS)
     ctx_auto = lookup_context_window(last["model_id"]) if last else None
-    # 生成速度：输出 token ÷ 生成耗时（首 token 之后到完成；无 first_token_at 时退化为总耗时）
+    # 生成速度：分母"首 token → 完成"只覆盖可见回答那段，而 output_tokens 含 reasoning_tokens
+    # （raw_usage_json 实测 out=5043 / reason=3649；且首 token 落在推理阶段结束后——推理 token
+    # 数与 TTFT 之比稳定在 176~183 t/s）。分子不减推理 = 拿推理 token 除以不含它的时间，实测
+    # 能冲到 10713 t/s。无 first_token_at 时（provider 未回传首 token 计时）切不出生成窗口，
+    # 退化为"输出 token ÷ 请求总耗时"；该分母含输入预处理（20 万 token 输入实测 8~10s），
+    # 只对长输出请求接近真实生成速度，短输出偏低——属数据缺失，不代表模型慢。
     tps = 0
     if last and last["output_tokens"]:
-        gen_ms = None
-        if last["first_token_at"] and last["completed_at"] and last["completed_at"] > last["first_token_at"]:
-            gen_ms = last["completed_at"] - last["first_token_at"]
+        if (last["first_token_at"] and last["completed_at"]
+                and last["completed_at"] > last["first_token_at"]):
+            vis = max(last["output_tokens"] - last["reasoning_tokens"], 0)
+            tps = round(vis / ((last["completed_at"] - last["first_token_at"]) / 1000), 1)
         elif last["duration_ms"]:
-            gen_ms = last["duration_ms"]
-        if gen_ms:
-            tps = round(last["output_tokens"] / (gen_ms / 1000), 1)
+            tps = round(last["output_tokens"] / (last["duration_ms"] / 1000), 1)
     sub_rows = con.execute(
         """select m.session_id, coalesce(m.agent,''), coalesce(s2.title,''), count(*),
                   coalesce(sum(m.computed_total_tokens),0),

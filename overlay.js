@@ -11,6 +11,9 @@
  *       变量（<html> 的 .dark 类翻转整套值，zai-light/zai-dark 特殊主题同样适配），
  *       MutationObserver 观察该类同步 .zu-light（仅剩阴影/光晕程度性差异）。
  * 数据：主进程泵推 window.__zusageUpdate；显示项可在 ⚙ 面板配置（localStorage 持久化）。
+ * 速度（v62）：TPS 分子扣除推理 token（zusage.py 侧算好，overlay 只呈现）——output_tokens
+ *       含 reasoning_tokens 而分母"首 token → 完成"不含推理阶段，原口径实测冲到 10713 t/s。
+ *       三档阈值随之抬到 150/70（修正后可见回答速度中位 ~225 t/s）。
  * 分屏（v61.1）：协调器每 600ms 扫描可见输入框，按 pane（data-pane-id）派发实例——
  *       一个 pane 一条，各自显示 composer 祖先链 data-session-id 指向的会话；
  *       各 pane 会话 id 汇总挂 window.__zusageWantSids 交泵强制拉取（旧泵忽略）。
@@ -146,7 +149,7 @@
   /* ---------- 实例工厂（v61.1）：一个 pane 一套 条/面板/气泡/tooltip/定位循环。
    * slot 0 保留 #zusage-bar/#zusage-tip 兼容 id（泵热更新按它清理），其余实例仅类名。 */
   function spawnInstance(pid, slot) {
-    var VERSION = "v61";   // v61：修正常聊天误藏（删 coverLock/穿透=被盖，改幽灵子树检测）+ 分屏多实例   // 随提交递增（悬停 ⚙ 面板可见）；未提交的中间迭代不涨号
+    var VERSION = "v62";   // v62：TPS 分子扣除推理 token、三档阈值抬到 150/70   // 随提交递增（悬停 ⚙ 面板可见）；未提交的中间迭代不涨号
     /* ---------- 状态（实例级） ---------- */
     var excOn = false,    // 本 pane 会话处于"上下文超限被拒"状态（render 时按 picked 会话计算）
       excGone = false,    // 用户点 ✕ 关闭了本次气泡；超限解除后自动复位
@@ -490,11 +493,15 @@
           (d.remote_error ? "\n⚠ " + L("最近一次远端查询失败：", "Last remote query failed: ") + d.remote_error : ""));
       }
       if (last.tps) {   // 最近一次请求的生成速度，置顶显示；随数值三档变色
-        var tpsCls = last.tps >= 70 ? "ok" : last.tps >= 40 ? "warm" : "hot";
+        var tpsCls = last.tps >= 150 ? "ok" : last.tps >= 70 ? "warm" : "hot";
         it(ico('<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>') +
           '<span class="' + tpsCls + '">' + last.tps + '</span><span class="dim">t/s</span>',
-          L("生成速度：最近完成请求的输出 tokens ÷ 生成耗时（首 token → 完成）\n≥70 t/s 绿色 · 40–70 黄色 · <40 红色",
-            "Generation speed: output tokens ÷ generation time of the latest completed request (first token → completion)\n≥70 t/s green · 40–70 yellow · <40 red"));
+          L("生成速度：最近完成请求的可见回答 tokens（已扣除推理 token）÷ 生成耗时（首 token → 完成）\n"
+            + "≥150 t/s 绿色 · 70–150 黄色 · <70 红色\n"
+            + "provider 未回传首 token 计时时退化为输出 tokens ÷ 请求总耗时，分母含输入预处理，读数偏低",
+            "Generation speed: visible answer tokens (reasoning excluded) ÷ generation time of the latest completed request (first token → completion)\n"
+            + "≥150 t/s green · 70–150 yellow · <70 red\n"
+            + "When the provider reports no first-token timing this falls back to output tokens ÷ total request time, which includes prompt processing and reads low"));
       }
       if (state.show.ctx) {
         var cw = parseInt(state.ctxOv, 10) || d.native_ctx || d.context_window || 0;
