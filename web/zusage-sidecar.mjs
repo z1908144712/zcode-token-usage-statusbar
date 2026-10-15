@@ -5,7 +5,7 @@
  * 为什么是旁挂而不是改 ZCode：
  *   直连页 HTML 由 server 每次请求从磁盘读（packages/server/src/http.ts:464），远控页由
  *   relay 伺服；两者都可以在 nginx 层注入一行 <script>。于是整套功能只需要
- *   「一个只读旁挂进程 + nginx 三行」，不碰 ZCode 源码、不重建、不重启 zcode-web / relay。
+ *   「一个只读旁挂进程 + nginx 三行」，不碰 ZCode 源码、不重建、不重启 ZCode web 与 relay。
  *
  * 数据链：
  *   常驻 python（zusage.py serve，经 readonly-guard.py 强制只读）
@@ -17,6 +17,11 @@
  *   1. readonly-guard.py 把 sqlite3.connect 强制成 mode=ro + PRAGMA query_only=1
  *   2. 本进程自己不开任何数据库连接
  *   3. 全程只 SELECT（由 zusage.py 决定）
+ *
+ * 鉴权（v2，2026-10-11 设备凭据模型）：快照/health 详情 = 浏览器设备会话 Cookie
+ *   （zcode_device_session / __Host-），透传 3030 /api/server-info 校验（30s 正缓存 /
+ *   5s 负缓存，fail closed）。旧单 token（.zcode-token / ?token= / x-zcode-lite-token）
+ *   全部退役不再认。
  *
  * 端口 3033，只监听 127.0.0.1，由 nginx 反代到 /zusage/。
  */
@@ -31,24 +36,63 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 /* ---------- 配置（全部可用环境变量覆盖，不落盘任何密钥） ---------- */
 const PORT = Number(process.env.ZUSAGE_PORT || 3033);
 const HOST = process.env.ZUSAGE_HOST || '127.0.0.1';
-/** 与 ZCode server 同一个 token（zcode-web.service 的 ZCODE_SERVER_TOKEN）。
- *  优先取进程环境；没有则读数据目录下的 .zcode-token（ZCode 自己已有的那份，权限 600）
- *  ——这样 systemd unit 里不必再抄一份密钥。 */
-/** ZCode 数据目录：优先用 ZCode 自己的环境变量派生，避免把部署路径写死。
- *  ZCODE_DATA_BASE_DIR 是 ZCode server 自己就在用的变量（zcode-web.service 里设的那个）。 */
+/**
+ * v2（2026-10-11 设备凭据模型对齐）：
+ *  - 旧 ZCODE_SERVER_TOKEN / /opt/zcode-data/.zcode-token（单 token）随旧模型退役，
+ *    本服务不再读取 .zcode-token（文件删除由部署脚本执行）。
+ *  - 快照接口鉴权改为「浏览器设备会话 Cookie」：透传请求 Cookie 到 ZCode server(3030)
+ *    /api/server-info，200 即有效（与直连页/远控页同一套配对会话，30s 正缓存）。
+ *  - /zusage/health 详情闸同样走会话校验。
+ *  - 本服务对 3030 的出站调用不再需要任何凭据（数据全部来自本机 sqlite 只读）。
+ */
 const DATA_DIR =
   (process.env.ZCODE_DATA_BASE_DIR || process.env.ZUSAGE_DATA_DIR || '/opt/zcode-data').trim();
 
-const TOKEN = resolveToken();
-function resolveToken() {
-  const env = (process.env.ZCODE_SERVER_TOKEN || process.env.ZUSAGE_TOKEN || '').trim();
-  if (env) return env;
-  const file = process.env.ZUSAGE_TOKEN_FILE || join(DATA_DIR, '.zcode-token');
-  try {
-    return readFileSync(file, 'utf8').trim();
-  } catch {
-    return '';
+/** ZCode server 源头（会话校验透传目标） */
+const ZCODE_ORIGIN = (process.env.ZCODE_HOST_ORIGIN || 'http://127.0.0.1:3030').replace(/\/+$/, '');
+
+/** 浏览器会话 Cookie 名（packages/server/src/deviceCredentialAuth.ts:54-55） */
+const SESSION_COOKIE_NAMES = ['__Host-zcode_device_session', 'zcode_device_session'];
+
+/** 会话校验缓存：值 -> { ok, at }（正 30s / 负 5s；与 relay 侧同一语义） */
+const verifyCache = new Map();
+const VERIFY_POSITIVE_TTL_MS = 30_000;
+const VERIFY_NEGATIVE_TTL_MS = 5_000;
+
+function pickSessionCookie(header) {
+  for (const part of String(header || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const name = part.slice(0, eq).trim();
+    if (SESSION_COOKIE_NAMES.includes(name)) return part.slice(eq + 1).trim();
   }
+  return '';
+}
+
+/** 返回 { ok, reason }；reason ∈ 'no-cookie'|'invalid'|'server-unreachable'|'ok'。fail closed。 */
+async function verifySessionCookie(header) {
+  const value = pickSessionCookie(header);
+  if (!value) return { ok: false, reason: 'no-cookie' };
+  const hit = verifyCache.get(value);
+  if (hit) {
+    const ttl = hit.ok ? VERIFY_POSITIVE_TTL_MS : VERIFY_NEGATIVE_TTL_MS;
+    if (Date.now() - hit.at < ttl) return { ok: hit.ok, reason: hit.ok ? 'ok' : 'invalid' };
+    verifyCache.delete(value);
+  }
+  let ok = false;
+  let reason = 'invalid';
+  try {
+    const r = await fetch(ZCODE_ORIGIN + '/api/server-info', {
+      headers: { cookie: `zcode_device_session=${value}` },
+    });
+    ok = r.status === 200;
+  } catch {
+    ok = false;
+    reason = 'server-unreachable';
+  }
+  verifyCache.set(value, { ok, at: Date.now() });
+  if (verifyCache.size > 512) verifyCache.delete(verifyCache.keys().next().value);
+  return { ok, reason: ok ? 'ok' : reason };
 }
 /** 插件目录（只读引用它的 zusage.py，不改一行）。
  *  两种布局都自定位：仓库内 web/ 的上一级就是仓库根；部署时 web/ 常与仓库目录并列。 */
@@ -252,8 +296,8 @@ function sanitize(raw) {
  * 为什么必须逐条修：zusage.py 的 context_window 来自 cfg["context_window"]（默认 128000）。
  * 插件的模型目录查表 CATALOG_PATH 是**硬编码的 Windows 路径**
  * （zusage.py:417 `D:\ZCode\resources\model-providers\...`），在 Linux 上永远落空 →
- * 落到 128000。而本机 deepseek-v4.1-flash 的真实窗口是 1000000，不修就会把
- * 248166 显示成 194%。
+ * 落到 128000。而真实窗口 1M 的模型，不修就会把
+ * 248166 显示成 194%（按 128000 算）。
  *
  * 会话池里每条都有自己的 last.model（顶层 last 永远是「最近会话」的，见 withMine），
  * 所以逐条按自己的模型查。
@@ -391,34 +435,14 @@ function send(res, code, body, headers = {}) {
   res.end(body);
 }
 
-function tokenOk(url, req) {
-  if (!TOKEN) return true;
-  // 凭证三选一：URL ?token=（旧恢复通道）→ Cookie（配对后的日常通道）→ Header
-  const readLiteTokenCookie = (header) => {
-    for (const part of String(header || '').split(';')) {
-      const eq = part.indexOf('=');
-      if (eq <= 0) continue;
-      if (part.slice(0, eq).trim() === 'zcode_lite_token') return part.slice(eq + 1).trim();
-    }
-    return '';
-  };
-  const candidates = [
-    url.searchParams.get('token') || '',
-    readLiteTokenCookie(req?.headers?.cookie),
-    String(req?.headers?.['x-zcode-lite-token'] || ''),
-  ];
-  for (const t of candidates) {
-    if (!t || t.length !== TOKEN.length) continue;
-    let diff = 0;
-    for (let i = 0; i < t.length; i++) diff |= t.charCodeAt(i) ^ TOKEN.charCodeAt(i);
-    if (diff === 0) return true;
-  }
-  return false;
+async function sessionOk(req) {
+  const verdict = await verifySessionCookie(req?.headers?.cookie);
+  return verdict.ok;
 }
 
 /** 静态文件白名单：只允许这几个路径，杜绝任意读文件。
  *  注意 overlay.js 是**我们自己的**一份实现（窄屏/宽屏自适应），不是插件仓库里那份
- *  Electron 桌面版 —— 方案 §5.2 决策 A：避免两套让位逻辑同时写同一个输入框卡片。 */
+ *  Electron 桌面版：避免两套让位逻辑同时写同一个输入框卡片。 */
 const STATIC = new Map([
   ['/zusage/boot.js', join(HERE, 'boot.js')],
   ['/zusage/overlay.js', join(HERE, 'overlay.js')],
@@ -429,14 +453,14 @@ const server = http.createServer(async (req, res) => {
   const path = url.pathname.replace(/\/+$/, '') || '/';
 
   /* /zusage/health 经 nginx 是公网可达的，所以公开分支只回一个 ok；
-   * 详情（含插件目录绝对路径）必须带 token 才给。 */
+   * 详情（含插件目录绝对路径）必须带有效设备会话 Cookie 才给。 */
   if (path === '/zusage/health') {
-    if (!tokenOk(url, req)) return send(res, 200, JSON.stringify({ ok: true }), { 'Content-Type': MIME['.json'] });
+    if (!(await sessionOk(req))) return send(res, 200, JSON.stringify({ ok: true }), { 'Content-Type': MIME['.json'] });
     return send(res, 200, JSON.stringify({
       ok: true,
       resident: !!child,
       unstable,
-      tokenRequired: !!TOKEN,
+      authMode: 'device-session-cookie',
       pluginDir: PLUGIN_DIR,
       ctxModels: loadContextCatalog().size,
     }), { 'Content-Type': MIME['.json'] });
@@ -456,7 +480,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (path === '/zusage/snapshot') {
-    if (!tokenOk(url, req)) return send(res, 401, JSON.stringify({ error: 'unauthorized' }), { 'Content-Type': MIME['.json'] });
+    if (!(await sessionOk(req))) return send(res, 401, JSON.stringify({ error: 'unauthorized' }), { 'Content-Type': MIME['.json'] });
     const sids = (url.searchParams.get('sids') || '').slice(0, 600);
     const mine = (url.searchParams.get('mine') || '').slice(0, 200);
     try {
@@ -475,7 +499,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   log(`zusage 旁挂服务 http://${HOST}:${PORT}`);
-  log('插件目录:', PLUGIN_DIR, '| token 校验:', TOKEN ? '开' : '关',);
+  log('鉴权模式: 设备会话 Cookie（透传 3030 /api/server-info 校验）| 数据源头:', ZCODE_ORIGIN);
   loadContextCatalog();
   log('模型目录载入:', ctxCatalog.size, '条');
   child = startChild();
